@@ -1,131 +1,94 @@
 """
-run.py — Master loop for funding-rate arbitrage pipeline.
+run.py — Master loop for funding rate arbitrage pipeline.
 
-Runs the full pipeline continuously until Ctrl+C:
-  1. fetch_funding_rates.py     → funding_rates.json
-  2. filter_active_contracts.py → funding_rates_v2.json
-  3. split_strategies.py        → ff_rates.json + sf_rates_v_1.json
-  4. enrich_sf_rates.py         → sf_rates_v_2.json
-  5. merge_rates.py             → funding_rates_v3.json
-  6. fetch_orderbooks.py        → funding_rates_v4.json  ← final output
+Each cycle:
+  1. run_pipeline() — fetch, filter, build FF+SF in-memory
+  2. save_results()  — write to PostgreSQL
+  3. Print summary
+  4. Wait CYCLE_INTERVAL seconds
+  5. Repeat
 
-On step failure: logs the error, uses last successful file, continues.
-On Ctrl+C:       finishes the current cycle then exits cleanly.
+Press Ctrl+C to stop after the current cycle completes.
 """
 
-import subprocess
-import sys
+import asyncio
 import time
-import os
 from datetime import datetime
-from pathlib import Path
 
-# ─── Config ──────────────────────────────────────────────────────────────────
+from pipeline import run_pipeline
+from db import create_pool, save_results
 
-WORKDIR = Path(__file__).parent
+CYCLE_INTERVAL = 60  # seconds between cycles
 
-STEPS = [
-    ("Funding rates",        "fetch_funding_rates.py"),
-    ("Active contracts",     "filter_active_contracts.py"),
-    ("Split strategies",     "split_strategies.py"),
-    ("Enrich SF rates",      "enrich_sf_rates.py"),
-    ("Merge rates",          "merge_rates.py"),
-    ("Orderbooks",           "fetch_orderbooks.py"),
-]
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-def log(msg: str) -> None:
-    print(f"[{now()}]  {msg}", flush=True)
-
-
-def separator(char: str = "-", width: int = 70) -> None:
+def separator(char: str = "─", width: int = 70) -> None:
     print(char * width, flush=True)
 
 
-def run_step(name: str, script: str) -> tuple[bool, float]:
-    """
-    Run a pipeline step.
-    Returns (success, elapsed_seconds).
-    On failure: prints stderr, returns (False, elapsed).
-    """
-    t0 = time.monotonic()
-    log(f"START  {name}  ({script})")
-
-    result = subprocess.run(
-        [sys.executable, str(WORKDIR / script)],
-        cwd=str(WORKDIR),
-        capture_output=False,   # stream stdout/stderr live to terminal
-    )
-
-    elapsed = time.monotonic() - t0
-    ok = result.returncode == 0
-
-    status = "OK" if ok else f"FAILED (exit {result.returncode})"
-    log(f"END    {name}  {status}  [{elapsed:.1f}s]")
-    return ok, elapsed
-
-
-# ─── Main loop ───────────────────────────────────────────────────────────────
-
-def main() -> None:
-    separator("=")
-    print("  Funding Rate Arbitrage Pipeline  —  run.py")
+async def main() -> None:
+    separator("═")
+    print("  Funding Rate Arbitrage Pipeline")
+    print(f"  Cycle interval: {CYCLE_INTERVAL}s")
     print("  Press Ctrl+C to stop after the current cycle completes.")
-    separator("=")
+    separator("═")
+
+    pool = await create_pool()
+    print(f"[{now()}]  DB connected\n")
 
     cycle = 0
-    stop_requested = False
+    last_results: list[dict] = []
 
     try:
         while True:
             cycle += 1
-            cycle_start = time.monotonic()
+            t0 = time.monotonic()
 
             separator()
-            log(f"CYCLE {cycle} started")
+            print(f"[{now()}]  CYCLE {cycle} started")
             separator()
 
-            step_results: list[tuple[str, bool, float]] = []
+            try:
+                results = await run_pipeline()
+                elapsed = time.monotonic() - t0
 
-            for name, script in STEPS:
-                ok, elapsed = run_step(name, script)
-                step_results.append((name, ok, elapsed))
+                ff_count = sum(1 for r in results if r.get("strategy") == "ff")
+                sf_count = sum(1 for r in results if r.get("strategy") == "sf")
 
-                if not ok:
-                    log(f"WARNING: '{name}' failed — continuing with last saved data")
+                if results:
+                    last_results = results
+                    await save_results(pool, results, cycle, ff_count, sf_count, elapsed)
 
-                print(flush=True)
+                separator()
+                print(f"[{now()}]  CYCLE {cycle} complete in {elapsed:.1f}s")
+                print(f"           FF: {ff_count}  |  SF: {sf_count}  |  Total: {len(results)}")
+                if results:
+                    top = results[0]
+                    ex  = f"{top.get('exchange_bid','?')} / {top.get('exchange_ask', top.get('exchange_ask_1','?'))}"
+                    print(f"           Top: {top['symbol']}  {top['spread']:.4f}%  [{ex}]")
+                separator()
 
-            # ── Cycle summary ─────────────────────────────────────────────
-            cycle_elapsed = time.monotonic() - cycle_start
-            failed = [n for n, ok, _ in step_results if not ok]
+            except Exception as e:
+                elapsed = time.monotonic() - t0
+                separator()
+                print(f"[{now()}]  CYCLE {cycle} FAILED in {elapsed:.1f}s — {e}")
+                if last_results:
+                    print(f"           Using last successful data ({len(last_results)} records)")
+                separator()
 
-            separator()
-            log(f"CYCLE {cycle} complete in {cycle_elapsed:.1f}s")
-            if failed:
-                log(f"  Failed steps: {', '.join(failed)}")
-            else:
-                log("  All steps succeeded")
-            log("  Output: funding_rates_v4.json")
-            separator()
-
-            if stop_requested:
-                break
-
-            print(flush=True)
+            print(f"[{now()}]  Next cycle in {CYCLE_INTERVAL}s...\n", flush=True)
+            await asyncio.sleep(CYCLE_INTERVAL)
 
     except KeyboardInterrupt:
-        separator("=")
-        log("Ctrl+C received — stopping after this cycle.")
-        separator("=")
-
-    log(f"Pipeline stopped after {cycle} cycle(s).")
+        separator("═")
+        print(f"[{now()}]  Ctrl+C — stopping after cycle {cycle}.")
+        separator("═")
+    finally:
+        await pool.close()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

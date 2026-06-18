@@ -2,16 +2,60 @@
 core/fetchers.py — Fetch current funding rates from all 8 exchanges.
 
 Each fetcher returns a list of dicts:
-  { "symbol": str, "exchange": str, "funding_rate": float }
+  { "symbol": str, "exchange": str, "funding_rate": float, "next_funding_time": float | None }
+
+next_funding_time is a unix timestamp in SECONDS (UTC), or None if the
+exchange didn't return it / parsing failed. No fallback or guessing —
+null means "we don't know", and the frontend must show that honestly.
 
 Main entry point: fetch_all(session) -> list[dict]
 """
 
 import asyncio
+import time
 import aiohttp
 from datetime import datetime
 
 from core.utils import fmt, valid
+
+
+# ─── next_funding_time parsing helpers ─────────────────────────────────────────
+
+def _ms_to_sec(value) -> float | None:
+    """Unix milliseconds (int/str/float) -> unix seconds. None on bad input."""
+    try:
+        v = float(value)
+        if v <= 0:
+            return None
+        return v / 1000.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _sec_passthrough(value) -> float | None:
+    """Unix seconds already -> unix seconds. None on bad input."""
+    try:
+        v = float(value)
+        if v <= 0:
+            return None
+        return v
+    except (TypeError, ValueError):
+        return None
+
+
+def _countdown_ms_to_abs_sec(value) -> float | None:
+    """
+    Some exchanges (KuCoin) return a countdown duration in ms
+    (milliseconds remaining), not an absolute timestamp.
+    Convert to an absolute unix-seconds timestamp using current time.
+    """
+    try:
+        v = float(value)
+        if v <= 0:
+            return None
+        return time.time() + (v / 1000.0)
+    except (TypeError, ValueError):
+        return None
 
 
 # ─── Per-exchange fetchers ────────────────────────────────────────────────────
@@ -33,7 +77,13 @@ async def fetch_binance(session: aiohttp.ClientSession) -> list[dict]:
             rate = fmt(float(funding_str))
             if not valid(rate):
                 continue
-            results.append({"symbol": item["symbol"], "exchange": "Binance", "funding_rate": rate})
+            next_ft = _ms_to_sec(item.get("nextFundingTime"))
+            results.append({
+                "symbol": item["symbol"],
+                "exchange": "Binance",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            })
         except (ValueError, KeyError):
             pass
     return results
@@ -56,7 +106,13 @@ async def fetch_bingx(session: aiohttp.ClientSession) -> list[dict]:
             rate = fmt(float(funding_str))
             if not valid(rate):
                 continue
-            results.append({"symbol": item["symbol"], "exchange": "BingX", "funding_rate": rate})
+            next_ft = _ms_to_sec(item.get("nextFundingTime"))
+            results.append({
+                "symbol": item["symbol"],
+                "exchange": "BingX",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            })
         except (ValueError, KeyError):
             pass
     return results
@@ -79,7 +135,14 @@ async def fetch_bitget(session: aiohttp.ClientSession) -> list[dict]:
             rate = fmt(float(funding))
             if not valid(rate):
                 continue
-            results.append({"symbol": item["symbol"], "exchange": "Bitget", "funding_rate": rate})
+            # Bitget tickers endpoint: "nextUpdate" (ms) is next funding settlement time
+            next_ft = _ms_to_sec(item.get("nextUpdate"))
+            results.append({
+                "symbol": item["symbol"],
+                "exchange": "Bitget",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            })
         except (ValueError, KeyError):
             pass
     return results
@@ -102,7 +165,13 @@ async def fetch_bybit(session: aiohttp.ClientSession) -> list[dict]:
             rate = fmt(float(funding))
             if not valid(rate):
                 continue
-            results.append({"symbol": item["symbol"], "exchange": "Bybit", "funding_rate": rate})
+            next_ft = _ms_to_sec(item.get("nextFundingTime"))
+            results.append({
+                "symbol": item["symbol"],
+                "exchange": "Bybit",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            })
         except (ValueError, KeyError):
             pass
     return results
@@ -126,7 +195,14 @@ async def fetch_gate(session: aiohttp.ClientSession) -> list[dict]:
             rate = fmt(float(funding))
             if not valid(rate):
                 continue
-            results.append({"symbol": symbol, "exchange": "Gate.io", "funding_rate": rate})
+            # Gate.io: "funding_next_apply" is unix SECONDS already
+            next_ft = _sec_passthrough(item.get("funding_next_apply"))
+            results.append({
+                "symbol": symbol,
+                "exchange": "Gate.io",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            })
         except (ValueError, KeyError):
             pass
     return results
@@ -149,7 +225,14 @@ async def fetch_kucoin(session: aiohttp.ClientSession) -> list[dict]:
             rate = fmt(float(funding))
             if not valid(rate):
                 continue
-            results.append({"symbol": item["symbol"], "exchange": "KuCoin", "funding_rate": rate})
+            # KuCoin: "nextFundingRateTime" is a COUNTDOWN in ms, not an absolute time
+            next_ft = _countdown_ms_to_abs_sec(item.get("nextFundingRateTime"))
+            results.append({
+                "symbol": item["symbol"],
+                "exchange": "KuCoin",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            })
         except (ValueError, KeyError):
             pass
     return results
@@ -172,7 +255,13 @@ async def fetch_mexc(session: aiohttp.ClientSession) -> list[dict]:
             rate = fmt(float(funding))
             if not valid(rate):
                 continue
-            results.append({"symbol": item["symbol"], "exchange": "MEXC", "funding_rate": rate})
+            next_ft = _ms_to_sec(item.get("nextSettleTime"))
+            results.append({
+                "symbol": item["symbol"],
+                "exchange": "MEXC",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            })
         except (ValueError, KeyError):
             pass
     return results
@@ -211,7 +300,13 @@ async def _okx_fetch_one(
             rate = fmt(float(funding_str))
             if not valid(rate):
                 return None
-            return {"symbol": inst_id, "exchange": "OKX", "funding_rate": rate}
+            next_ft = _ms_to_sec(items[0].get("nextFundingTime"))
+            return {
+                "symbol": inst_id,
+                "exchange": "OKX",
+                "funding_rate": rate,
+                "next_funding_time": next_ft,
+            }
         except Exception:
             return None
 
@@ -255,8 +350,9 @@ async def fetch_all(session: aiohttp.ClientSession) -> list[dict]:
         if isinstance(result, Exception):
             print(f"  x {name:10s}  ERROR — {result}")
         else:
+            with_time = sum(1 for r in result if r.get("next_funding_time"))
             all_results.extend(result)
-            print(f"  v {name:10s}  {len(result):4d} symbols")
+            print(f"  v {name:10s}  {len(result):4d} symbols  ({with_time} with next_funding_time)")
 
     # Remove USDC-base symbols
     before = len(all_results)

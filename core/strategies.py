@@ -4,11 +4,14 @@ core/strategies.py — Build FF and SF opportunity lists from funding rate recor
 FF (Futures/Futures):
   SHORT on exchange_bid (higher rate), LONG on exchange_ask (lower rate)
   spread = funding_rate_bid - funding_rate_ask  (always > 0)
+  next_funding_time = the EARLIEST of the two exchanges' next settlement —
+    that's the next moment either leg of the trade actually pays/charges funding.
 
 SF (Spot/Futures):
   SHORT futures (collect funding), BUY spot as hedge
   Only when funding_rate > 0
   exchange_ask_1..N — spot exchanges that list the coin
+  next_funding_time = the futures exchange's next settlement (only leg that has funding)
 """
 
 import asyncio
@@ -44,14 +47,29 @@ def build_ff_pairs(records: list[dict]) -> list[dict]:
             if spread <= 0:
                 continue
 
+            # Per-exchange settlement times — shown individually under each exchange on the card.
+            bid_t = bid.get("next_funding_time")
+            ask_t = ask.get("next_funding_time")
+
+            # Earliest known next settlement across both legs — used for the card footer summary.
+            # If one side is missing (None), fall back to whichever is known.
+            # If both are missing, stays None — no fallback fabrication.
+            if bid_t is not None and ask_t is not None:
+                next_ft = min(bid_t, ask_t)
+            else:
+                next_ft = bid_t if bid_t is not None else ask_t
+
             rows.append({
-                "symbol":           symbol,
-                "strategy":         "ff",
-                "exchange_bid":     bid["exchange"],
-                "exchange_ask":     ask["exchange"],
-                "funding_rate_bid": bid["funding_rate"],
-                "funding_rate_ask": ask["funding_rate"],
-                "spread":           round(spread * 100, 10),
+                "symbol":                symbol,
+                "strategy":              "ff",
+                "exchange_bid":          bid["exchange"],
+                "exchange_ask":          ask["exchange"],
+                "funding_rate_bid":      bid["funding_rate"],
+                "funding_rate_ask":      ask["funding_rate"],
+                "spread":                round(spread * 100, 10),
+                "next_funding_time":     next_ft,
+                "next_funding_time_bid": bid_t,
+                "next_funding_time_ask": ask_t,
             })
 
     rows.sort(key=lambda x: x["spread"], reverse=True)
@@ -214,6 +232,7 @@ async def build_sf_list(records: list[dict], session: aiohttp.ClientSession) -> 
         futures_exchange = rec["exchange"]
         symbol           = rec["symbol"]
         funding_rate     = rec["funding_rate"]
+        next_ft          = rec.get("next_funding_time")  # only the futures leg has funding
         base             = base_from_futures(symbol, futures_exchange).upper()
 
         ask_exchanges = [
@@ -226,11 +245,12 @@ async def build_sf_list(records: list[dict], session: aiohttp.ClientSession) -> 
             continue
 
         row: dict = {
-            "symbol":       symbol,
-            "strategy":     "sf",
-            "exchange_bid": futures_exchange,
-            "funding_rate": funding_rate,
-            "spread":       round(funding_rate * 100, 10),
+            "symbol":            symbol,
+            "strategy":          "sf",
+            "exchange_bid":      futures_exchange,
+            "funding_rate":      funding_rate,
+            "spread":            round(funding_rate * 100, 10),
+            "next_funding_time": next_ft,
         }
         for idx, ex in enumerate(ask_exchanges, start=1):
             row[f"exchange_ask_{idx}"] = ex
