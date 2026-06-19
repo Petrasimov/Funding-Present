@@ -119,7 +119,7 @@ async def fetch_bingx(session: aiohttp.ClientSession) -> list[dict]:
 
 
 async def fetch_bitget(session: aiohttp.ClientSession) -> list[dict]:
-    url = "https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES"
+    url = "https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES"
     async with session.get(url) as resp:
         resp.raise_for_status()
         data = await resp.json()
@@ -239,7 +239,7 @@ async def fetch_kucoin(session: aiohttp.ClientSession) -> list[dict]:
 
 
 async def fetch_mexc(session: aiohttp.ClientSession) -> list[dict]:
-    url = "https://contract.mexc.com/api/v1/contract/ticker"
+    url = "https://contract.mexc.com/api/v1/contract/funding_rate"
     async with session.get(url) as resp:
         resp.raise_for_status()
         data = await resp.json()
